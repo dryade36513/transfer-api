@@ -2,24 +2,14 @@ name = "unlimited-transfer-api"
 main = "src/worker.js"
 compatibility_date = "2025-11-21"
 
-# Store upstream keys as secrets instead of committing them here:
-#   wrangler secret put UNLIMITED_SURF_API_KEY          # single key (legacy)
-#   wrangler secret put UNLIMITED_SURF_API_KEYS         # multiple keys, newline or comma separated
+# ═══════════════════════════════════════════════════════
+# API Key 不要寫在這個檔案！（會被 Git 推上 GitHub）
 #
-# Optional: protect this Worker with client-facing key(s):
-#   wrangler secret put WORKER_API_KEY                  # single key (legacy)
-#   wrangler secret put WORKER_API_KEYS                 # multiple keys, newline or comma separated
-#
-# When WORKER_API_KEY or WORKER_API_KEYS is set, clients must send a matching key as
-# Authorization: Bearer <key>, x-api-key: <key>, or anthropic-api-key: <key>.
-# If no worker keys are set, the Worker keeps compatibility mode and accepts any client key.
-#
-# Upstream key pool (UNLIMITED_SURF_API_KEYS): requests round-robin across keys.
-# On upstream 429 or 401, the Worker automatically retries with the next key in the pool.
-#
-# Clients can also send their own key as Authorization: Bearer <key>
-# or x-api-key: <key>; the Worker forwards it upstream when no upstream secret is set
-# and no worker key protection is enabled.
+# 本地測試 → 填 .dev.vars（已幫你建好）
+# 正式部署 → 在終端機執行：
+#   wrangler secret put UNLIMITED_SURF_API_KEYS
+#   然後貼上 10 把 Key（換行或逗號分隔都行）
+# ═══════════════════════════════════════════════════════
 
 [vars]
 UPSTREAM_BASE_URL = "https://unlimited.surf"
