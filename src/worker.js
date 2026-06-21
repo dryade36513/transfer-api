@@ -9,6 +9,8 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "content-type,request-id,x-request-id",
 };
 
+let upstreamKeyCursor = 0;
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -442,8 +444,9 @@ function responsesToChatBody(body, fallbackModel) {
 async function proxyUpstream(request, env, path) {
   const upstreamUrl = new URL(path + new URL(request.url).search, upstreamBase(env));
   const headers = new Headers(request.headers);
-  const key = optionalUpstreamApiKey(request, env);
-  if (key) headers.set("authorization", `Bearer ${key}`);
+  headers.delete("authorization");
+  headers.delete("x-api-key");
+  headers.delete("anthropic-api-key");
   headers.delete("host");
 
   const init = {
@@ -453,16 +456,21 @@ async function proxyUpstream(request, env, path) {
     redirect: "manual",
   };
 
-  const response = await fetch(upstreamUrl, init);
+  const response = await fetchUpstreamWithPool(upstreamUrl, init, env, request);
   return addCors(response);
 }
 
 async function callUnlimitedJson(request, env, path, payload) {
-  const response = await fetch(new URL(path, upstreamBase(env)), {
-    method: "POST",
-    headers: upstreamHeaders(request, env, false),
-    body: JSON.stringify(payload || {}),
-  });
+  const response = await fetchUpstreamWithPool(
+    new URL(path, upstreamBase(env)),
+    {
+      method: "POST",
+      headers: buildUpstreamJsonHeaders(false),
+      body: JSON.stringify(payload || {}),
+    },
+    env,
+    request,
+  );
 
   if (!response.ok) {
     throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
@@ -472,11 +480,16 @@ async function callUnlimitedJson(request, env, path, payload) {
 }
 
 async function callUnlimitedStream(request, env, path, payload) {
-  const response = await fetch(new URL(path, upstreamBase(env)), {
-    method: "POST",
-    headers: upstreamHeaders(request, env, true),
-    body: JSON.stringify(payload || {}),
-  });
+  const response = await fetchUpstreamWithPool(
+    new URL(path, upstreamBase(env)),
+    {
+      method: "POST",
+      headers: buildUpstreamJsonHeaders(true),
+      body: JSON.stringify(payload || {}),
+    },
+    env,
+    request,
+  );
 
   if (!response.ok) {
     throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
@@ -503,10 +516,12 @@ async function collectUnlimitedText(request, env, path, payload) {
 
 async function getModelCatalog(request, env) {
   try {
-    const headers = new Headers();
-    const key = optionalUpstreamApiKey(request, env);
-    if (key) headers.set("Authorization", `Bearer ${key}`);
-    const response = await fetch(new URL("/api/models", upstreamBase(env)), { headers });
+    const response = await fetchUpstreamWithPool(
+      new URL("/api/models", upstreamBase(env)),
+      { method: "GET", headers: new Headers() },
+      env,
+      request,
+    );
     if (!response.ok) throw new Error(`models failed: ${response.status}`);
     const data = await response.json();
     const models = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : [];
@@ -809,40 +824,99 @@ async function readJson(request) {
   }
 }
 
-function upstreamHeaders(request, env, wantsStream) {
+function buildUpstreamJsonHeaders(wantsStream) {
   const headers = new Headers();
-  headers.set("Authorization", `Bearer ${upstreamApiKey(request, env)}`);
   headers.set("Content-Type", "application/json");
   if (wantsStream) headers.set("Accept", "text/event-stream");
   return headers;
 }
 
-function upstreamApiKey(request, env) {
-  const key = optionalUpstreamApiKey(request, env);
-  if (key) return key;
-
-  if (env.WORKER_API_KEY) {
-    throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY when WORKER_API_KEY is enabled.");
-  }
-
-  throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY or pass Authorization: Bearer <key> / x-api-key: <key>.");
+function parseKeyList(value) {
+  if (!value || typeof value !== "string") return [];
+  return value.split(/[\n,]+/).map((key) => key.trim()).filter(Boolean);
 }
 
-function optionalUpstreamApiKey(request, env) {
-  const configured = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
-  if (configured) return configured;
+function getUpstreamKeys(env) {
+  const pool = parseKeyList(env.UNLIMITED_SURF_API_KEYS);
+  if (pool.length) return pool;
 
-  if (env.WORKER_API_KEY) return "";
+  const single = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
+  return single ? [single] : [];
+}
 
-  return clientApiKey(request);
+function getWorkerKeys(env) {
+  const pool = parseKeyList(env.WORKER_API_KEYS);
+  if (pool.length) return pool;
+
+  const single = env.WORKER_API_KEY;
+  return single ? [single] : [];
+}
+
+function hasWorkerKeyProtection(env) {
+  return getWorkerKeys(env).length > 0;
+}
+
+function resolveUpstreamKeys(request, env) {
+  const keys = getUpstreamKeys(env);
+  if (keys.length) return keys;
+
+  if (hasWorkerKeyProtection(env)) return [];
+
+  const clientKey = clientApiKey(request);
+  return clientKey ? [clientKey] : [];
+}
+
+async function fetchUpstreamWithPool(url, init, env, request) {
+  const keys = resolveUpstreamKeys(request, env);
+  if (!keys.length) {
+    throw new Error(
+      "Missing upstream API key. Set UNLIMITED_SURF_API_KEYS or UNLIMITED_SURF_API_KEY when worker keys are enabled.",
+    );
+  }
+
+  const poolSize = keys.length;
+  const startIndex = upstreamKeyCursor % poolSize;
+  let lastResponse = null;
+
+  for (let attempt = 0; attempt < poolSize; attempt += 1) {
+    const keyIndex = (startIndex + attempt) % poolSize;
+    const apiKey = keys[keyIndex];
+    const headers = new Headers(init.headers || {});
+    headers.set("Authorization", `Bearer ${apiKey}`);
+
+    const response = await fetch(url, { ...init, headers });
+
+    if (response.status === 429 || response.status === 401) {
+      console.log(JSON.stringify({
+        upstream_key_index: keyIndex,
+        attempt,
+        status: response.status,
+        failover: true,
+      }));
+      lastResponse = response;
+      continue;
+    }
+
+    upstreamKeyCursor = (keyIndex + 1) % poolSize;
+    console.log(JSON.stringify({
+      upstream_key_index: keyIndex,
+      attempt,
+      status: response.status,
+      failover: false,
+    }));
+    return response;
+  }
+
+  console.log(JSON.stringify({ upstream_exhausted: true, pool_size: poolSize }));
+  return lastResponse;
 }
 
 function validateWorkerApiKey(request, env) {
-  const expected = env.WORKER_API_KEY;
-  if (!expected) return null;
+  const allowedKeys = getWorkerKeys(env);
+  if (!allowedKeys.length) return null;
 
   const actual = clientApiKey(request);
-  if (actual && constantTimeEqual(actual, expected)) return null;
+  if (actual && allowedKeys.some((key) => constantTimeEqual(actual, key))) return null;
 
   return jsonResponse({
     error: {
@@ -1074,10 +1148,15 @@ function looksLikeAnthropicRequest(request) {
 
 function serviceInfo(request, env) {
   const origin = new URL(request.url).origin;
+  const upstreamKeys = getUpstreamKeys(env);
+  const workerKeys = getWorkerKeys(env);
   return {
     ok: true,
     service: "unlimited.surf OpenAI/Anthropic compatibility Worker",
     upstream: stripTrailingSlash(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL),
+    upstream_key_pool_size: upstreamKeys.length,
+    worker_key_pool_size: workerKeys.length,
+    key_rotation: upstreamKeys.length > 1 ? "round_robin_with_failover" : "single_key",
     routes: {
       raw: `${origin}/api/chat, /api/search, /api/merge, /api/models, /api/key, /api/attachments/extract`,
       openai: `${origin}/v1/chat/completions, /v1/responses, /v1/models, /v1/files`,

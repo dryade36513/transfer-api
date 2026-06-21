@@ -16,8 +16,36 @@
 - Merge AI：映射到上游 `POST /api/merge`。
 - Files：上传/提取映射到上游 `POST /api/attachments/extract`。
 - Agent Setup、Codex、MCP：提供说明和配置入口，分别是 `/v1/setup`、`/v1/codex`、`/v1/mcp`。
+- **多 Key 负载均衡**：支持配置多个上游 key 轮调，429/401 自动换 key 重试；支持多个客户端 key 白名单。
 
 注意：MCP server 仍然需要在本地 agent、IDE 或 Claude Code/Codex 环境里运行。这个 Worker 只提供模型 API 端点，不会在 Cloudflare 边缘侧读取或修改你的本地文件。
+
+## 多 Key 负载均衡
+
+Worker 支持两层 Key 池：
+
+| Secret | 用途 | 行为 |
+|--------|------|------|
+| `UNLIMITED_SURF_API_KEYS` | 上游 unlimited.surf key 池 | Round-Robin 轮调；429/401 自动换 key 重试 |
+| `WORKER_API_KEYS` | 客户端访问 key 白名单 | 任一有效 key 即可访问 Worker |
+
+也兼容旧版单 key：`UNLIMITED_SURF_API_KEY`、`WORKER_API_KEY`。
+
+配置示例（10 把 key，换行分隔）：
+
+```text
+UNLIMITED_SURF_API_KEYS=key1
+key2
+key3
+...
+WORKER_API_KEYS=client-key-1
+client-key-2
+...
+```
+
+本地开发可在 `.dev.vars` 中填写（该文件已在 `.gitignore` 中）。
+
+`/health` 会返回 `upstream_key_pool_size`、`worker_key_pool_size` 和 `key_rotation`，不会暴露 key 明文。调试轮调时可运行 `wrangler tail` 查看 `upstream_key_index` 日志。
 
 ## 通过 GitHub 关联 Cloudflare 自动部署
 
@@ -57,16 +85,20 @@ npm install && npx wrangler deploy
 
 ### 4. 添加 Cloudflare Secret
 
-在 Worker 设置里添加上游 key：
+在 Worker 设置里添加上游 key（单 key 或多 key 二选一）：
 
 ```text
 UNLIMITED_SURF_API_KEY=<你的 unlimited.surf key>
+# 或
+UNLIMITED_SURF_API_KEYS=<key1 换行 key2 换行 ...>
 ```
 
-推荐再添加一个客户端访问 key，用来保护你的 Worker：
+推荐再添加客户端访问 key，用来保护 Worker（单 key 或多 key 白名单）：
 
 ```text
 WORKER_API_KEY=<你自定义的调用密钥>
+# 或
+WORKER_API_KEYS=<client-key-1 换行 client-key-2 换行 ...>
 ```
 
 通常位置是：
@@ -77,7 +109,7 @@ Workers & Pages -> 你的 Worker -> Settings -> Variables -> Secrets
 
 请只把 key 放到 Secret 里，不要写进 `wrangler.toml`、`README.md` 或任何 GitHub 文件。
 
-如果设置了 `WORKER_API_KEY`，客户端调用 Worker 时必须传这个 key。如果没有设置 `WORKER_API_KEY`，Worker 会保持兼容模式，客户端传任意 key 都可以，真正请求上游时使用 `UNLIMITED_SURF_API_KEY`。
+如果设置了 `WORKER_API_KEY` 或 `WORKER_API_KEYS`，客户端调用 Worker 时必须传白名单中的任一 key。如果没有设置 worker key，Worker 会保持兼容模式，客户端传任意 key 都可以，真正请求上游时使用 `UNLIMITED_SURF_API_KEY(S)` 轮调。
 
 ### 5. 部署后验证
 
@@ -87,7 +119,7 @@ Workers & Pages -> 你的 Worker -> Settings -> Variables -> Secrets
 https://<your-worker>.workers.dev/health
 ```
 
-看到 JSON 里有 `"ok": true` 即表示 Worker 正常运行。
+看到 JSON 里有 `"ok": true` 即表示 Worker 正常运行。多 key 模式下还会显示 `upstream_key_pool_size` 和 `key_rotation`。
 
 如果已经设置 `WORKER_API_KEY`，验证请求也需要带上它：
 
@@ -118,17 +150,28 @@ curl https://<your-worker>.workers.dev/v1/setup \
 npm install -g wrangler
 wrangler login
 wrangler secret put UNLIMITED_SURF_API_KEY
+wrangler secret put UNLIMITED_SURF_API_KEYS
 wrangler secret put WORKER_API_KEY
+wrangler secret put WORKER_API_KEYS
 wrangler deploy
 ```
 
-`UNLIMITED_SURF_API_KEY` 填 unlimited.surf 的真实 key。`WORKER_API_KEY` 填你自定义给客户端使用的 key。
+单 key 与多 key 可并存配置：若设置了 `UNLIMITED_SURF_API_KEYS` / `WORKER_API_KEYS`，优先使用 key 池；否则 fallback 到单 key。
 
-`WORKER_API_KEY` 是可选的：如果不设置，客户端可以传任意 key；如果设置了，客户端必须传这个 key。也可以不配置 `UNLIMITED_SURF_API_KEY`，改为每次请求直接传 unlimited.surf key，但不推荐这样做。
+`UNLIMITED_SURF_API_KEY(S)` 填 unlimited.surf 的真实 key。`WORKER_API_KEY(S)` 填你自定义给客户端使用的 key。
+
+`WORKER_API_KEY(S)` 是可选的：如果不设置，客户端可以传任意 key；如果设置了，客户端必须传白名单中的 key。也可以不配置上游 secret，改为每次请求直接传 unlimited.surf key，但不推荐这样做。
 
 ## 调用时使用哪个 key
 
-推荐配置两个 Secret：
+推荐配置上游 key 池 + 客户端 key 白名单：
+
+```text
+UNLIMITED_SURF_API_KEYS=<key1 换行 key2 ...>
+WORKER_API_KEYS=<client-key-1 换行 client-key-2 ...>
+```
+
+也兼容旧版单 key 配置：
 
 ```text
 UNLIMITED_SURF_API_KEY=<你的 unlimited.surf key>
@@ -147,14 +190,15 @@ curl https://<your-worker>.workers.dev/v1/chat/completions \
 规则如下：
 
 ```text
-设置了 WORKER_API_KEY:
-  客户端必须传 WORKER_API_KEY
-  Worker 使用 UNLIMITED_SURF_API_KEY 请求 unlimited.surf
+设置了 WORKER_API_KEY 或 WORKER_API_KEYS:
+  客户端必须传白名单中的任一 key
+  Worker 使用 UNLIMITED_SURF_API_KEYS 轮调请求 unlimited.surf
+  上游 429/401 时自动换下一个 key 重试
 
-没有设置 WORKER_API_KEY:
+没有设置 worker key:
   客户端传任意 key 都可以
-  Worker 优先使用 UNLIMITED_SURF_API_KEY 请求 unlimited.surf
-  如果也没有 UNLIMITED_SURF_API_KEY，则把客户端传入的 key 当作 unlimited.surf key
+  Worker 优先使用 UNLIMITED_SURF_API_KEY(S) 轮调请求 unlimited.surf
+  如果也没有上游 secret，则把客户端传入的 key 当作 unlimited.surf key
 ```
 
 ## OpenAI 兼容接口
@@ -241,8 +285,35 @@ This is a Cloudflare Worker adapter for `https://unlimited.surf`. It exposes Ope
 - Merge AI maps to upstream `POST /api/merge`.
 - Files extraction maps to upstream `POST /api/attachments/extract`.
 - Agent Setup, Codex, and MCP info endpoints are available at `/v1/setup`, `/v1/codex`, and `/v1/mcp`.
+- **Multi-key load balancing**: upstream key pool with round-robin and automatic 429/401 failover; client key whitelist support.
 
 MCP servers still run inside your local agent, IDE, Claude Code, or Codex environment. This Worker only provides the model API endpoint and does not read or modify local files from Cloudflare.
+
+## Multi-key load balancing
+
+The Worker supports two key pools:
+
+| Secret | Purpose | Behavior |
+|--------|---------|----------|
+| `UNLIMITED_SURF_API_KEYS` | Upstream unlimited.surf key pool | Round-robin; auto-retry on 429/401 |
+| `WORKER_API_KEYS` | Client access key whitelist | Any valid key grants access |
+
+Legacy single-key secrets (`UNLIMITED_SURF_API_KEY`, `WORKER_API_KEY`) remain supported.
+
+Example (10 keys, newline-separated):
+
+```text
+UNLIMITED_SURF_API_KEYS=key1
+key2
+...
+WORKER_API_KEYS=client-key-1
+client-key-2
+...
+```
+
+For local dev, put values in `.dev.vars` (gitignored).
+
+`/health` returns `upstream_key_pool_size`, `worker_key_pool_size`, and `key_rotation` without exposing key values. Use `wrangler tail` to inspect `upstream_key_index` logs during debugging.
 
 ## Deploy from GitHub with Cloudflare
 
@@ -282,16 +353,20 @@ npm install && npx wrangler deploy
 
 ### 4. Add the Cloudflare Secret
 
-Add the upstream key in the Worker settings:
+Add upstream key(s) in the Worker settings (single or pool):
 
 ```text
 UNLIMITED_SURF_API_KEY=<your unlimited.surf key>
+# or
+UNLIMITED_SURF_API_KEYS=<key1 newline key2 ...>
 ```
 
-Recommended: add a client-facing key to protect the Worker:
+Recommended: add client-facing key(s) to protect the Worker:
 
 ```text
 WORKER_API_KEY=<your custom client key>
+# or
+WORKER_API_KEYS=<client-key-1 newline client-key-2 ...>
 ```
 
 The usual location is:
@@ -302,7 +377,7 @@ Workers & Pages -> your Worker -> Settings -> Variables -> Secrets
 
 Keep keys in Secrets only. Do not put them in `wrangler.toml`, `README.md`, or GitHub files.
 
-If `WORKER_API_KEY` is set, clients must send that key when calling the Worker. If `WORKER_API_KEY` is not set, the Worker keeps compatibility mode and accepts any client key while using `UNLIMITED_SURF_API_KEY` for upstream requests.
+If `WORKER_API_KEY` or `WORKER_API_KEYS` is set, clients must send a whitelisted key when calling the Worker. If no worker keys are set, the Worker keeps compatibility mode and accepts any client key while round-robinning `UNLIMITED_SURF_API_KEY(S)` for upstream requests.
 
 ### 5. Verify the deployment
 
@@ -312,7 +387,7 @@ Open:
 https://<your-worker>.workers.dev/health
 ```
 
-You should see JSON with `"ok": true`.
+You should see JSON with `"ok": true`. With multiple keys configured, it also shows `upstream_key_pool_size` and `key_rotation`.
 
 If `WORKER_API_KEY` is set, include it in verification requests too:
 
@@ -343,17 +418,28 @@ You can also deploy from your local machine:
 npm install -g wrangler
 wrangler login
 wrangler secret put UNLIMITED_SURF_API_KEY
+wrangler secret put UNLIMITED_SURF_API_KEYS
 wrangler secret put WORKER_API_KEY
+wrangler secret put WORKER_API_KEYS
 wrangler deploy
 ```
 
-Use your real unlimited.surf key for `UNLIMITED_SURF_API_KEY`. Use your own client-facing key for `WORKER_API_KEY`.
+If `UNLIMITED_SURF_API_KEYS` / `WORKER_API_KEYS` are set, the pools take priority; otherwise the Worker falls back to single-key secrets.
 
-`WORKER_API_KEY` is optional. If it is not set, clients may send any key. If it is set, clients must send this exact key. You can also skip `UNLIMITED_SURF_API_KEY` and pass the real unlimited.surf key on every request, but that is not recommended.
+Use your real unlimited.surf key(s) for `UNLIMITED_SURF_API_KEY(S)`. Use your own client-facing key(s) for `WORKER_API_KEY(S)`.
+
+`WORKER_API_KEY(S)` is optional. If not set, clients may send any key. If set, clients must send a whitelisted key. You can also skip upstream secrets and pass the unlimited.surf key on every request, but that is not recommended.
 
 ## Which key should clients use?
 
-Recommended setup:
+Recommended setup (key pools):
+
+```text
+UNLIMITED_SURF_API_KEYS=<key1 newline key2 ...>
+WORKER_API_KEYS=<client-key-1 newline client-key-2 ...>
+```
+
+Legacy single-key setup also works:
 
 ```text
 UNLIMITED_SURF_API_KEY=<your unlimited.surf key>
@@ -372,14 +458,15 @@ curl https://<your-worker>.workers.dev/v1/chat/completions \
 Rules:
 
 ```text
-WORKER_API_KEY is set:
-  clients must send WORKER_API_KEY
-  Worker uses UNLIMITED_SURF_API_KEY for unlimited.surf
+WORKER_API_KEY or WORKER_API_KEYS is set:
+  clients must send a whitelisted key
+  Worker round-robins UNLIMITED_SURF_API_KEYS for unlimited.surf
+  retries with the next key on upstream 429/401
 
-WORKER_API_KEY is not set:
+No worker key is set:
   clients may send any key
-  Worker prefers UNLIMITED_SURF_API_KEY for unlimited.surf
-  if UNLIMITED_SURF_API_KEY is also missing, the client key is treated as the unlimited.surf key
+  Worker prefers UNLIMITED_SURF_API_KEY(S) for unlimited.surf
+  if upstream secrets are also missing, the client key is treated as the unlimited.surf key
 ```
 
 ## OpenAI-compatible routes

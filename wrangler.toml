@@ -2,17 +2,24 @@ name = "unlimited-transfer-api"
 main = "src/worker.js"
 compatibility_date = "2025-11-21"
 
-# Store the upstream key as a secret instead of committing it here:
-#   wrangler secret put UNLIMITED_SURF_API_KEY
+# Store upstream keys as secrets instead of committing them here:
+#   wrangler secret put UNLIMITED_SURF_API_KEY          # single key (legacy)
+#   wrangler secret put UNLIMITED_SURF_API_KEYS         # multiple keys, newline or comma separated
 #
-# Optional: protect this Worker with your own client-facing key:
-#   wrangler secret put WORKER_API_KEY
-# When WORKER_API_KEY is set, clients must send it as Authorization: Bearer <key>,
-# x-api-key: <key>, or anthropic-api-key: <key>. If it is not set, the Worker
-# keeps the old behavior and accepts any client key.
+# Optional: protect this Worker with client-facing key(s):
+#   wrangler secret put WORKER_API_KEY                  # single key (legacy)
+#   wrangler secret put WORKER_API_KEYS                 # multiple keys, newline or comma separated
+#
+# When WORKER_API_KEY or WORKER_API_KEYS is set, clients must send a matching key as
+# Authorization: Bearer <key>, x-api-key: <key>, or anthropic-api-key: <key>.
+# If no worker keys are set, the Worker keeps compatibility mode and accepts any client key.
+#
+# Upstream key pool (UNLIMITED_SURF_API_KEYS): requests round-robin across keys.
+# On upstream 429 or 401, the Worker automatically retries with the next key in the pool.
 #
 # Clients can also send their own key as Authorization: Bearer <key>
-# or x-api-key: <key>; the Worker forwards it upstream when no secret is set.
+# or x-api-key: <key>; the Worker forwards it upstream when no upstream secret is set
+# and no worker key protection is enabled.
 
 [vars]
 UPSTREAM_BASE_URL = "https://unlimited.surf"
